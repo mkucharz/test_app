@@ -1,0 +1,155 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: registry.kucharz.net
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # 2. Load deployment configuration
+      - name: Load deployment config
+        run: |
+          set -a
+          source deploy-config.env
+          set +a
+          
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+          echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
+          echo "APP_PORT=$APP_PORT" >> $GITHUB_ENV
+          echo "DOCKER_REGISTRY=$DOCKER_REGISTRY" >> $GITHUB_ENV
+          echo "DEPLOY_HOST=$DEPLOY_HOST" >> $GITHUB_ENV
+          echo "DEPLOY_USER=$DEPLOY_USER" >> $GITHUB_ENV
+          echo "DEPLOY_PATH=$DEPLOY_PATH" >> $GITHUB_ENV
+          echo "HEALTH_CHECK_URL=$HEALTH_CHECK_URL" >> $GITHUB_ENV
+      
+      # 3. Determine version
+      - name: Set version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=latest
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Deploying version: $VERSION"
+      
+      # 4. Login to Docker registry
+      - name: Login to Docker Registry
+        run: |
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login ${{ env.REGISTRY }} \
+            -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
+      
+      # 5. Build Docker image
+      - name: Build Docker image
+        run: |
+          IMAGE_TAG=${{ env.REGISTRY }}/mkucharz/${{ env.APP_NAME }}:${{ env.VERSION }}
+          echo "Building: $IMAGE_TAG"
+          
+          docker build -t $IMAGE_TAG .
+          docker tag $IMAGE_TAG ${{ env.REGISTRY }}/mkucharz/${{ env.APP_NAME }}:latest
+          
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+      
+      # 6. Push Docker image
+      - name: Push Docker image
+        run: |
+          docker push ${{ env.REGISTRY }}/mkucharz/${{ env.APP_NAME }}:${{ env.VERSION }}
+          docker push ${{ env.REGISTRY }}/mkucharz/${{ env.APP_NAME }}:latest
+          echo "✅ Pushed: ${{ env.IMAGE_TAG }}"
+      
+      # 7. Setup SSH
+      - name: Setup SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ env.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+      
+      # 8. Deploy to server
+      - name: Deploy to server
+        run: |
+          echo "🚀 Deploying to ${{ env.DEPLOY_HOST }}..."
+          
+          # Create deployment directory
+          ssh -i ~/.ssh/deploy_key ${{ env.DEPLOY_USER }}@${{ env.DEPLOY_HOST }} \
+            "mkdir -p ${{ env.DEPLOY_PATH }}"
+          
+          # Copy docker-compose.yml
+          scp -i ~/.ssh/deploy_key docker-compose.yml \
+            ${{ env.DEPLOY_USER }}@${{ env.DEPLOY_HOST }}:${{ env.DEPLOY_PATH }}/
+          
+          # Create .env file on server
+          ssh -i ~/.ssh/deploy_key ${{ env.DEPLOY_USER }}@${{ env.DEPLOY_HOST }} \
+            "cat > ${{ env.DEPLOY_PATH }}/.env << 'EOF'
+          APP_NAME=${{ env.APP_NAME }}
+          VERSION=${{ env.VERSION }}
+          DOMAIN=${{ env.DOMAIN }}
+          APP_PORT=${{ env.APP_PORT }}
+          DOCKER_REGISTRY=${{ env.DOCKER_REGISTRY }}
+          EOF"
+          
+          # Deploy
+          ssh -i ~/.ssh/deploy_key ${{ env.DEPLOY_USER }}@${{ env.DEPLOY_HOST }} << 'ENDSSH'
+            cd ${{ env.DEPLOY_PATH }}
+            
+            echo "📥 Pulling latest image..."
+            docker-compose pull
+            
+            echo "🔄 Restarting services..."
+            docker-compose up -d --remove-orphans
+            
+            echo "✅ Deployment complete!"
+            docker-compose ps
+          ENDSSH
+      
+      # 9. Health check
+      - name: Health check
+        run: |
+          echo "🏥 Running health check..."
+          echo "Waiting 15 seconds for service to start..."
+          sleep 15
+          
+          for i in {1..5}; do
+            echo "Attempt $i/5: Checking ${{ env.HEALTH_CHECK_URL }}"
+            
+            if curl -f -s -o /dev/null -w "%{http_code}" ${{ env.HEALTH_CHECK_URL }} | grep -q "200"; then
+              echo "✅ Health check passed!"
+              echo "🎉 Deployment successful: ${{ env.DOMAIN }}"
+              exit 0
+            fi
+            
+            echo "⏳ Health check failed, retrying in 10 seconds..."
+            sleep 10
+          done
+          
+          echo "❌ Health check failed after 5 attempts"
+          echo "⚠️ Deployment may have issues, please check manually"
+          exit 1
+      
+      # 10. Deployment summary
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎉 DEPLOYMENT SUCCESSFUL!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📦 App: ${{ env.APP_NAME }}"
+          echo "🏷️  Version: ${{ env.VERSION }}"
+          echo "🌐 URL: https://${{ env.DOMAIN }}"
+          echo "🖼️  Image: ${{ env.IMAGE_TAG }}"
+          echo "📍 Server: ${{ env.DEPLOY_HOST }}:${{ env.DEPLOY_PATH }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

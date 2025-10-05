@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  webapp:
+    image: ${DOCKER_REGISTRY:-registry.kucharz.net}/mkucharz/${APP_NAME:-webapp}:${VERSION:-latest}
+    container_name: ${APP_NAME:-webapp}
+    restart: unless-stopped
+    
+    # Reverse proxy configuration
+    environment:
+      - VIRTUAL_HOST=${DOMAIN}
+      - LETSENCRYPT_HOST=${DOMAIN}
+      - LETSENCRYPT_EMAIL=m@kucharz.net
+    
+    # Port mapping
+    ports:
+      - "${APP_PORT:-8080}:80"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Networks
+    networks:
+      - default
+      - ${APP_NAME:-webapp}_default
+
+networks:
+  ${APP_NAME:-webapp}_default:
+    name: ${APP_NAME:-webapp}_default
